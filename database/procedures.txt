@@ -1,0 +1,354 @@
+CREATE OR REPLACE FUNCTION Date2EnrollYear(dDate IN DATE)
+RETURN NUMBER
+IS
+ nYear NUMBER;
+ sMonth CHAR(2);
+BEGIN
+ /* 11월~4월: 1학기, 5~10월: 2학기 */
+ SELECT TO_NUMBER(TO_CHAR(dDate, 'YYYY')), TO_CHAR(dDate, 'MM')
+ INTO nYear, sMonth
+ FROM DUAL;
+ IF (sMonth = '11' or sMonth = '12') THEN
+ nYear := nYear + 1;
+ END IF;
+ RETURN nYear;
+END;
+/
+
+CREATE OR REPLACE FUNCTION Date2EnrollSemester(dDate IN DATE)
+RETURN NUMBER
+IS
+ nSemester NUMBER;
+ sMonth CHAR(2);
+BEGIN
+ /* 11월 ~ 4월 : 1학기, 5월 ~ 10월 : 2학기 */
+ SELECT TO_CHAR(dDate, 'MM')
+ INTO sMonth
+ FROM DUAL;
+ IF (sMonth='11' or sMonth='12' or (sMonth >= '01' and sMonth <= '04')) THEN
+  nSemester := 1;
+ ELSE
+  nSemester := 2;
+ END IF;
+RETURN nSemester;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE InsertEnroll(sStudentId IN VARCHAR2,
+ sCourseId IN VARCHAR2,
+ nCourseIdNo IN NUMBER,
+ result OUT VARCHAR2)
+IS
+ too_many_sumCourseUnit EXCEPTION;
+ too_many_courses EXCEPTION;
+ too_many_students EXCEPTION;
+ duplicate_time EXCEPTION;
+ nYear NUMBER;
+ nSemester NUMBER;
+ nSumCourseUnit NUMBER;
+ nCourseUnit NUMBER;
+ nCnt NUMBER;
+ nTeachMax NUMBER;
+BEGIN
+ result := '';
+ DBMS_OUTPUT.put_line('#');
+ DBMS_OUTPUT.put_line(sStudentId || '님이 과목번호 ' || sCourseid || 
+ ', 분반 ' || TO_CHAR(nCourseIdNo) || '의 수강 등록을 요청하였습니다.');
+
+ /* 년도, 학기 알아내기 */
+ nYear := Date2EnrollYear(SYSDATE);
+ nSemester := Date2EnrollSemester(SYSDATE);
+
+ /* 에러 처리 1 : 최대학점 초과여부 */
+ SELECT SUM(c.c_unit)
+ INTO nSumCourseUnit
+ FROM course c, enroll e
+ WHERE e.s_id = sStudentId and e.e_year = nYear and e.e_semester = nSemester
+ and e.c_id = c.c_id and e.c_id_no = c.c_id_no;
+
+ SELECT c_unit
+ INTO nCourseUnit
+ FROM course
+ WHERE c_id = sCourseId and c_id_no = nCourseIdNo;
+
+ IF (nSumCourseUnit + nCourseUnit > 18) THEN
+  RAISE too_many_sumCourseUnit;
+ END IF;
+
+ /* 에러 처리 2 : 동일한 과목 신청 여부 */
+ SELECT COUNT(*)
+ INTO nCnt
+ FROM enroll
+ WHERE s_id = sStudentId and c_id = sCourseId;
+
+ IF (nCnt > 0) THEN
+  RAISE too_many_courses;
+ END IF;
+
+ /* 에러 처리 3 : 수강신청 인원 초과 여부 */
+ SELECT t_max
+ INTO nTeachMax
+ FROM teach
+ WHERE t_year = nYear and t_semester = nSemester and c_id = sCourseId
+ and c_id_no = nCourseIdNo;
+
+ SELECT COUNT(*)
+ INTO nCnt
+ FROM enroll
+ WHERE e_year = nYear and e_semester = nSemester
+ and c_id = sCourseId and c_id_no = nCourseIdNo;
+ IF (nCnt >= nTeachMax) THEN
+  RAISE too_many_students;
+ END IF;
+
+ /* 에러 처리 4 : 신청한 과목들 시간 중복 여부 */
+ SELECT COUNT(*)
+ INTO nCnt
+ FROM (SELECT t_time
+          FROM teach
+          WHERE t_year=nYear and t_semester = nSemester
+ and c_id = sCourseId and c_id_no = nCourseIdNo
+          INTERSECT
+          SELECT t.t_time
+          FROM teach t, enroll e
+          WHERE e.s_id=sStudentId and e.e_year=nYear
+          and e.e_semester = nSemester and t.t_year=nYear
+          and t.t_semester = nSemester and e.c_id=t.c_id
+          and e.c_id_no=t.c_id_no);
+ IF (nCnt > 0) THEN
+  RAISE duplicate_time;
+ END IF;
+
+ /* 수강 신청 등록*/
+ INSERT INTO enroll(S_ID, C_ID, C_ID_NO, E_YEAR, E_SEMESTER)
+ VALUES (sStudentId, sCourseId, nCourseIdNo, nYear, nSemester);
+ COMMIT;
+ result := '수강신청 등록이 완료되었습니다.';
+
+ EXCEPTION
+ WHEN too_many_sumCourseUnit THEN
+ result := '최대학점을 초과하였습니다';
+ WHEN too_many_courses THEN
+ result := '이미 등록된 과목을 신청하였습니다';
+ WHEN too_many_students THEN
+ result := '수강신청 인원이 초과되어 등록이 불가능합니다';
+ WHEN duplicate_time THEN
+ result := '이미 등록된 과목 중 중복되는 시간이 존재합니다';
+ WHEN OTHERS THEN
+ ROLLBACK;
+ result := SQLCODE;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE SelectTimeTable
+ (sStudentId IN VARCHAR2,
+ nYear IN NUMBER,
+ nSemester IN NUMBER)
+IS
+ sId COURSE.C_ID%TYPE;
+ sName COURSE.C_NAME%TYPE;
+ nIdNo COURSE.C_ID_NO%TYPE;
+ nUnit COURSE.C_UNIT%TYPE;
+ nTime TEACH.T_TIME%TYPE;
+ sWhere TEACH.T_WHERE%TYPE;
+ nTotUnit NUMBER := 0;
+CURSOR cur (sStudentId VARCHAR2, nYear NUMBER, nSemester NUMBER) IS
+ SELECT e.c_id, c.c_name, e.c_id_no, c.c_unit, t.t_time, t.t_where
+ FROM enroll e, course c, teach t
+ WHERE e.s_id = sStudentId and e.e_year = nYear
+ and e.e_semester=nSemester
+ and t.t_year = nYear and t.t_semester = nSemester
+ and e.c_id = c.c_id and e.c_id_no=c.c_id_no
+ and c.c_id=t.c_id and c.c_id_no = t.c_id_no
+ ORDER BY 5;
+BEGIN
+ OPEN cur(sStudentId, nYear, nSemester);
+ DBMS_OUTPUT.put_line('#');
+ DBMS_OUTPUT.put_line(TO_CHAR(nYear) || '년도 ' || TO_CHAR(nSemester) ||
+  '학기의 ' || sStudentId || '님의 수강신청 시간표입니다.');
+ LOOP
+ FETCH cur INTO sId, sName, nIdNo, nUnit, nTime, sWhere;
+ EXIT WHEN cur%NOTFOUND;
+ DBMS_OUTPUT.put_line('교시:' || TO_CHAR(nTime) || ', 과목번호: ' || sID ||
+  ', 과목명: ' || sName || ', 분반: ' || TO_CHAR(nIdNo) ||
+  ', 학점: ' || TO_CHAR(nUnit) || ', 장소: ' || sWhere);
+ nTotUnit := nTotUnit + nUnit;
+ END LOOP;
+ DBMS_OUTPUT.put_line('총 ' || TO_CHAR(cur%ROWCOUNT) || ' 과목과 총 '
+  || TO_CHAR(nTotUnit) || '학점을 신청하였습니다.');
+ CLOSE cur;
+END;
+/
+
+DECLARE
+result VARCHAR2(100) := '';
+BEGIN
+DBMS_OUTPUT.enable;
+DBMS_OUTPUT.put_line('**************** Insert 및 에러 처리 테스트 ********************');
+
+/* 에러 처리 2 : 동일한 과목 신청 여부 : 데이터베이스 과목 신청 */
+InsertEnroll('20011234', 'C400', 3, result);
+DBMS_OUTPUT.put_line('결과 : ' || result);
+
+/* 에러 처리 3 : 수강신청 인원 초과 여부 : 객체지향 윈도우즈 프로그래밍 신청 */
+InsertEnroll('20011234', 'C900', 3, result);
+DBMS_OUTPUT.put_line('결과 : ' || result);
+
+/* 에러 처리 4 : 신청한 과목들 시간 중복 여부 : 멀티미디어 개론 신청 */
+InsertEnroll('20011234', 'M100', 3, result);
+DBMS_OUTPUT.put_line('결과 : ' || result);
+
+/* 에러가 없는 경우 */
+InsertEnroll('20011234', 'C800', 3, result);
+DBMS_OUTPUT.put_line('결과 : ' || result);
+
+/* 에러 처리 1 : 최대 학점 초과 여부 검사 : 게임 프로그래밍 신청 */
+InsertEnroll('20011234', 'M700', 3, result);
+DBMS_OUTPUT.put_line('결과 : ' || result);
+DBMS_OUTPUT.put_line('***************** CURSOR를 이용한 SELECT 테스트 *****************');
+
+/* 최종 결과 확인 */
+SelectTimeTable('20011234', 2020, 1);
+delete from enroll where s_id='20011234' and c_id='C800' and c_id_no=3;
+END;
+/
+
+CREATE OR REPLACE TRIGGER BeforeUpdateStudent
+BEFORE UPDATE ON student
+FOR EACH ROW
+DECLARE
+ underflow_length EXCEPTION;
+ invalid_value EXCEPTION;
+ nLength NUMBER;
+ nBlank NUMBER;
+BEGIN
+ /* 학년 제약조건 : DDL에서 해결 */
+ /* 보다 복잡한 제약조건을 다루기 편하게 함 */
+ /* 암호 제약조건 : 4자리 이상, blank는 허용안함 */
+ SELECT length(:new.s_pwd), instr(:new.s_pwd, ' ')
+ INTO nLength, nBlank
+ FROM DUAL;
+ IF (nLength < 4) THEN
+  RAISE underflow_length;
+ ELSIF (nBlank > 0) THEN
+  RAISE invalid_value;
+ END IF;
+EXCEPTION
+ WHEN underflow_length THEN
+  RAISE_APPLICATION_ERROR(-20002, '암호는 4자리 이상이어야 합니다');
+ WHEN invalid_value THEN
+  RAISE_APPLICATION_ERROR(-20003, '암호에 공란은 입력되지 않습니다.');
+END;
+/
+
+CREATE OR REPLACE PROCEDURE DeleteEnroll(sStudentId IN VARCHAR2,
+ sCourseId IN VARCHAR2,
+ nCourseIdNo IN NUMBER,
+ result OUT VARCHAR2)
+IS
+ too_little_sumCourseUnit EXCEPTION;
+ nYear NUMBER;
+ nSemester NUMBER;
+ nSumCourseUnit NUMBER;
+ nCourseUnit NUMBER;
+BEGIN
+ result := '';
+ DBMS_OUTPUT.put_line('#');
+ DBMS_OUTPUT.put_line(sStudentId || '님이 과목번호 ' || sCourseid || 
+ ', 분반 ' || TO_CHAR(nCourseIdNo) || '의 수강 삭제를 요청하였습니다.');
+
+ /* 년도, 학기 알아내기 */
+ nYear := Date2EnrollYear(SYSDATE);
+ nSemester := Date2EnrollSemester(SYSDATE);
+
+ /* 에러 처리 : 최소학점 미만여부 */
+ SELECT SUM(c.c_unit)
+ INTO nSumCourseUnit
+ FROM course c, enroll e
+ WHERE e.s_id = sStudentId and e.e_year = nYear and e.e_semester = nSemester
+ and e.c_id = c.c_id and e.c_id_no = c.c_id_no;
+
+ SELECT c_unit
+ INTO nCourseUnit
+ FROM course
+ WHERE c_id = sCourseId and c_id_no = nCourseIdNo;
+
+ IF (nSumCourseUnit - nCourseUnit < 12) THEN
+  RAISE too_little_sumCourseUnit;
+ END IF;
+
+ /* 수강 신청 삭제*/
+ DELETE FROM enroll WHERE s_id=sStudentID and c_id=sCourseId and c_id_no=nCourseIdNo and e_year=nYear and e_semester=nSemester;
+ COMMIT;
+ result := '수강신청 삭제가 완료되었습니다.';
+
+ EXCEPTION
+ WHEN too_little_sumCourseUnit THEN
+ result := '최소 12학점 이상 신청해야 합니다';
+ WHEN OTHERS THEN
+ ROLLBACK;
+ result := SQLCODE;
+END;
+/
+
+CREATE OR REPLACE FUNCTION Date2TeachYear(dDate IN DATE)
+RETURN NUMBER
+IS
+ nYear NUMBER;
+ sMonth CHAR(2);
+BEGIN
+ /* 11월~4월: 1학기, 5~10월: 2학기 */
+ SELECT TO_NUMBER(TO_CHAR(dDate, 'YYYY')), TO_CHAR(dDate, 'MM')
+ INTO nYear, sMonth
+ FROM DUAL;
+ IF (sMonth = '11' or sMonth = '12') THEN
+ nYear := nYear + 1;
+ END IF;
+ RETURN nYear;
+END;
+/
+
+CREATE OR REPLACE FUNCTION Date2TeachSemester(dDate IN DATE)
+RETURN NUMBER
+IS
+ nSemester NUMBER;
+ sMonth CHAR(2);
+BEGIN
+ /* 11월 ~ 4월 : 1학기, 5월 ~ 10월 : 2학기 */
+ SELECT TO_CHAR(dDate, 'MM')
+ INTO sMonth
+ FROM DUAL;
+ IF (sMonth='11' or sMonth='12' or (sMonth >= '01' and sMonth <= '04')) THEN
+  nSemester := 1;
+ ELSE
+  nSemester := 2;
+ END IF;
+RETURN nSemester;
+END;
+/
+
+CREATE OR REPLACE TRIGGER BeforeUpdateProfessor
+BEFORE UPDATE ON professor
+FOR EACH ROW
+DECLARE
+ underflow_length EXCEPTION;
+ invalid_value EXCEPTION;
+ nLength NUMBER;
+ nBlank NUMBER;
+BEGIN
+ /* 암호 제약조건 : 4자리 이상, blank는 허용안함 */
+ SELECT length(:new.p_pwd), instr(:new.p_pwd, ' ')
+ INTO nLength, nBlank
+ FROM DUAL;
+ IF (nLength < 4) THEN
+  RAISE underflow_length;
+ ELSIF (nBlank > 0) THEN
+  RAISE invalid_value;
+ END IF;
+EXCEPTION
+ WHEN underflow_length THEN
+  RAISE_APPLICATION_ERROR(-20002, '암호는 4자리 이상이어야 합니다');
+ WHEN invalid_value THEN
+  RAISE_APPLICATION_ERROR(-20003, '암호에 공란은 입력되지 않습니다.');
+END;
+/
